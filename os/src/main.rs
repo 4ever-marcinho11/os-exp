@@ -37,3 +37,12 @@ pub fn rust_main() -> ! {
     task::run_first_task();
     panic!("Unreachable in rust_main!");
 }
+
+extern crate alloc;
+
+#![feature(alloc_error_handler)]
+
+mod mm;
+
+mm::init();
+
