@@ -1,152 +1,109 @@
 mod context;
-mod switch;
-mod task;
 
-use crate::loader::{get_num_app, get_app_data};
-use crate::trap::TrapContext;
-use crate::sync::UPSafeCell;
-use lazy_static::*;
-use switch::__switch;
-use task::{TaskControlBlock, TaskStatus};
-use alloc::vec::Vec;
+use core::arch::asm;
+use core::arch::global_asm;
+use riscv::register::{
+    mtvec::TrapMode,
+    stvec,
+    scause::{
+        self,
+        Trap,
+        Exception,
+        Interrupt,
+    },
+    stval,
+    sie,
+};
 
-pub use context::TaskContext;
+use crate::syscall::syscall;
+use crate::task::{
+    exit_current_and_run_next,
+    suspend_current_and_run_next,
+    current_user_token,
+    current_trap_cx,
+};
 
-pub struct TaskManager {
-    num_app: usize,
-    inner: UPSafeCell<TaskManagerInner>,
+use crate::timer::set_next_trigger;
+use crate::config::{TRAP_CONTEXT, TRAMPOLINE};
+
+global_asm!(include_str!("trap.S"));
+
+pub fn init() {
+    set_kernel_trap_entry();
 }
 
-struct TaskManagerInner {
-    tasks: Vec<TaskControlBlock>,
-    current_task: usize,
+fn set_kernel_trap_entry() {
+    unsafe {
+        stvec::write(trap_from_kernel as usize, TrapMode::Direct);
+    }
 }
 
-lazy_static! {
-    pub static ref TASK_MANAGER: TaskManager = {
-        println!("init TASK_MANAGER");
-        let num_app = get_num_app();
-        println!("num_app = {}", num_app);
-        let mut tasks: Vec<TaskControlBlock> = Vec::new();
-        for i in 0..num_app {
-            tasks.push(TaskControlBlock::new(
-                get_app_data(i),
-                i,
-            ));
-        }
-        TaskManager {
-            num_app,
-            inner: unsafe { UPSafeCell::new(TaskManagerInner {
-                tasks,
-                current_task: 0,
-            })},
-        }
-    };
+fn set_user_trap_entry() {
+    unsafe {
+        stvec::write(TRAMPOLINE as usize, TrapMode::Direct);
+    }
 }
 
-impl TaskManager {
-    fn run_first_task(&self) -> ! {
-        let mut inner = self.inner.exclusive_access();
-        let next_task = &mut inner.tasks[0];
-        next_task.task_status = TaskStatus::Running;
-        let next_task_cx_ptr = &next_task.task_cx as *const TaskContext;
-        drop(inner);
-        let mut _unused = TaskContext::zero_init();
-        // before this, we should drop local variables that must be dropped manually
-        unsafe {
-            __switch(
-                &mut _unused as *mut _,
-                next_task_cx_ptr,
-            );
+pub fn enable_timer_interrupt() {
+    unsafe { sie::set_stimer(); }
+}
+
+#[no_mangle]
+pub fn trap_handler() -> ! {
+    set_kernel_trap_entry();
+    let cx = current_trap_cx();
+    let scause = scause::read();
+    let stval = stval::read();
+    match scause.cause() {
+        Trap::Exception(Exception::UserEnvCall) => {
+            cx.sepc += 4;
+            cx.x[10] = syscall(cx.x[17], [cx.x[10], cx.x[11], cx.x[12]]) as usize;
         }
-        panic!("unreachable in run_first_task!");
-    }
-
-    fn mark_current_suspended(&self) {
-        let mut inner = self.inner.exclusive_access();
-        let cur = inner.current_task;
-        inner.tasks[cur].task_status = TaskStatus::Ready;
-    }
-
-    fn mark_current_exited(&self) {
-        let mut inner = self.inner.exclusive_access();
-        let cur = inner.current_task;
-        inner.tasks[cur].task_status = TaskStatus::Exited;
-    }
-
-    fn find_next_task(&self) -> Option<usize> {
-        let inner = self.inner.exclusive_access();
-        let current = inner.current_task;
-        (current + 1..current + self.num_app + 1)
-            .map(|id| id % self.num_app)
-            .find(|id| {
-                inner.tasks[*id].task_status == TaskStatus::Ready
-            })
-    }
-
-    fn get_current_token(&self) -> usize {
-        let inner = self.inner.exclusive_access();
-        inner.tasks[inner.current_task].get_user_token()
-    }
-
-    fn get_current_trap_cx(&self) -> &mut TrapContext {
-        let inner = self.inner.exclusive_access();
-        inner.tasks[inner.current_task].get_trap_cx()
-    }
-
-    fn run_next_task(&self) {
-        if let Some(next) = self.find_next_task() {
-            let mut inner = self.inner.exclusive_access();
-            let current = inner.current_task;
-            inner.tasks[next].task_status = TaskStatus::Running;
-            inner.current_task = next;
-            let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
-            let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
-            drop(inner);
-            // before this, we should drop local variables that must be dropped manually
-            unsafe {
-                __switch(
-                    current_task_cx_ptr,
-                    next_task_cx_ptr,
-                );
-            }
-            // go back to user mode
-        } else {
-            panic!("All applications completed!");
+        Trap::Exception(Exception::StoreFault) |
+        Trap::Exception(Exception::StorePageFault) => {
+            println!("[kernel] PageFault in application, bad addr = {:#x}, bad instruction = {:#x}, core dumped.", stval, cx.sepc);
+            exit_current_and_run_next();
+        }
+        Trap::Exception(Exception::IllegalInstruction) => {
+            println!("[kernel] IllegalInstruction in application, core dumped.");
+            exit_current_and_run_next();
+        }
+        Trap::Interrupt(Interrupt::SupervisorTimer) => {
+            set_next_trigger();
+            suspend_current_and_run_next();
+        }
+        _ => {
+            panic!("Unsupported trap {:?}, stval = {:#x}!", scause.cause(), stval);
         }
     }
+    trap_return();
 }
 
-pub fn run_first_task() {
-    TASK_MANAGER.run_first_task();
+#[no_mangle]
+pub fn trap_return() -> ! {
+    set_user_trap_entry();
+    let trap_cx_ptr = TRAP_CONTEXT;
+    let user_satp = current_user_token();
+    extern "C" {
+        fn __alltraps();
+        fn __restore();
+    }
+    let restore_va = __restore as usize - __alltraps as usize + TRAMPOLINE;
+    unsafe {
+        asm!(
+            "fence.i",
+            "jr {restore_va}",
+            restore_va = in(reg) restore_va,
+            in("a0") trap_cx_ptr,
+            in("a1") user_satp,
+            options(noreturn)
+        );
+    }
 }
 
-fn run_next_task() {
-    TASK_MANAGER.run_next_task();
+#[no_mangle]
+pub fn trap_from_kernel() -> ! {
+    panic!("a trap from kernel!");
 }
 
-fn mark_current_suspended() {
-    TASK_MANAGER.mark_current_suspended();
-}
-
-fn mark_current_exited() {
-    TASK_MANAGER.mark_current_exited();
-}
-
-pub fn suspend_current_and_run_next() {
-    mark_current_suspended();
-    run_next_task();
-}
-
-pub fn exit_current_and_run_next() {
-    mark_current_exited();
-    run_next_task();
-}
-
-pub fn current_user_token() -> usize {
-    TASK_MANAGER.get_current_token()
-}
-
-pub fn current_trap_cx() -> &'static mut TrapContext {
-    TASK_MANAGER.get_current_trap_cx()
-}
+pub use context::{TrapContext};

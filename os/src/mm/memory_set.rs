@@ -30,27 +30,10 @@ extern "C" {
     fn strampoline();
 }
 
-pub struct MapArea {
-    vpn_range: VPNRange,
-    data_frames: BTreeMap<VirtPageNum, FrameTracker>,
-    map_type: MapType,
-    map_perm: MapPermission,
-}
-
-pub struct MapArea {
-    vpn_range: VPNRange,
-    data_frames: BTreeMap<VirtPageNum, FrameTracker>,
-    map_type: MapType,
-    map_perm: MapPermission,
-}
-
-bitflags! {
-    pub struct MapPermission: u8 {
-        const R = 1 << 1;
-        const W = 1 << 2;
-        const X = 1 << 3;
-        const U = 1 << 4;
-    }
+lazy_static! {
+    pub static ref KERNEL_SPACE: Arc<UPSafeCell<MemorySet>> = Arc::new(unsafe {
+        UPSafeCell::new(MemorySet::new_kernel()
+    )});
 }
 
 pub struct MemorySet {
@@ -92,16 +75,7 @@ impl MemorySet {
             PTEFlags::R | PTEFlags::X,
         );
     }
-    pub fn activate(&self) {
-        let satp = self.page_table.token();
-        unsafe {
-            satp::write(satp);
-            asm!("sfence.vma");
-        }
-    }
-    pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
-        self.page_table.translate(vpn)
-    }
+    /// Without kernel stacks.
     pub fn new_kernel() -> Self {
         let mut memory_set = Self::new_bare();
         // map trampoline
@@ -205,6 +179,23 @@ impl MemorySet {
         ), None);
         (memory_set, user_stack_top, elf.header.pt2.entry_point() as usize)
     }
+    pub fn activate(&self) {
+        let satp = self.page_table.token();
+        unsafe {
+            satp::write(satp);
+            asm!("sfence.vma");
+        }
+    }
+    pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
+        self.page_table.translate(vpn)
+    }
+}
+
+pub struct MapArea {
+    vpn_range: VPNRange,
+    data_frames: BTreeMap<VirtPageNum, FrameTracker>,
+    map_type: MapType,
+    map_perm: MapPermission,
 }
 
 impl MapArea {
@@ -283,10 +274,19 @@ impl MapArea {
     }
 }
 
-lazy_static! {
-    pub static ref KERNEL_SPACE: Arc<UPSafeCell<MemorySet>> = Arc::new(unsafe {
-        UPSafeCell::new(MemorySet::new_kernel()
-    )});
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub enum MapType {
+    Identical,
+    Framed,
+}
+
+bitflags! {
+    pub struct MapPermission: u8 {
+        const R = 1 << 1;
+        const W = 1 << 2;
+        const X = 1 << 3;
+        const U = 1 << 4;
+    }
 }
 
 #[allow(unused)]
@@ -309,4 +309,3 @@ pub fn remap_test() {
     );
     println!("remap_test passed!");
 }
-
