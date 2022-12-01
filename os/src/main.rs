@@ -46,3 +46,5 @@ mod mm;
 
 mm::init();
 
+#[macro_use]
+extern crate bitflags;
