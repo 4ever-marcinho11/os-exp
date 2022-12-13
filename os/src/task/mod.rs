@@ -13,7 +13,6 @@ use alloc::sync::Arc;
 use manager::fetch_task;
 
 pub use context::TaskContext;
-
 pub use processor::{
     run_tasks,
     current_task,
@@ -22,9 +21,7 @@ pub use processor::{
     take_current_task,
     schedule,
 };
-
 pub use manager::add_task;
-
 pub use pid::{PidHandle, pid_alloc, KernelStack};
 
 pub fn suspend_current_and_run_next() {
